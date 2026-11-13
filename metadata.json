@@ -1,0 +1,6 @@
+{
+  "name": "ClearSlate AI Watermark Remover & Image Restorer",
+  "description": "AI-powered watermark detection, content-aware inpainting restoration, bulk image processing, and Google Drive batch import and export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
