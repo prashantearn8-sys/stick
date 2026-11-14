@@ -10,11 +10,19 @@ export interface DriveFileItem {
   webViewLink?: string;
 }
 
+export const DRIVE_FOLDER_MIME = 'application/vnd.google-apps.folder';
+
+export function isDriveFolder(file: DriveFileItem): boolean {
+  return file.mimeType === DRIVE_FOLDER_MIME;
+}
+
 /**
- * Lists image files from the user's Google Drive with automatic pagination for unlimited image batches.
+ * Lists folders and image files from the user's Google Drive with automatic pagination.
+ * When folderId is provided, lists folders and images directly inside that folder.
  */
 export async function listDriveImages(
   searchQuery = '',
+  folderId?: string,
   pageSize = 100
 ): Promise<DriveFileItem[]> {
   const token = await getAccessToken();
@@ -22,7 +30,11 @@ export async function listDriveImages(
     throw new Error('AUTH_REQUIRED');
   }
 
-  let q = "mimeType contains 'image/' and trashed = false";
+  let q = `(mimeType contains 'image/' or mimeType = '${DRIVE_FOLDER_MIME}') and trashed = false`;
+  if (folderId) {
+    const escapedFolderId = folderId.replace(/'/g, "\\'");
+    q += ` and '${escapedFolderId}' in parents`;
+  }
   if (searchQuery.trim()) {
     const escaped = searchQuery.trim().replace(/'/g, "\\'");
     q += ` and name contains '${escaped}'`;
@@ -36,7 +48,7 @@ export async function listDriveImages(
     const params = new URLSearchParams({
       q,
       pageSize: String(pageSize),
-      orderBy: 'modifiedTime desc',
+      orderBy: 'folder,modifiedTime desc',
       fields:
         'nextPageToken,files(id,name,mimeType,size,modifiedTime,thumbnailLink,webViewLink)',
     });
@@ -61,7 +73,7 @@ export async function listDriveImages(
     if (!res.ok) {
       const errData = await res.json().catch(() => ({}));
       throw new Error(
-        errData?.error?.message || 'Failed to fetch images from Google Drive.'
+        errData?.error?.message || 'Failed to fetch files from Google Drive.'
       );
     }
 
@@ -74,6 +86,46 @@ export async function listDriveImages(
   } while (pageToken && pagesFetched < 10);
 
   return allFiles;
+}
+
+/**
+ * Recursively collects all image files inside a selected Google Drive folder (including nested subfolders).
+ */
+export async function listImagesInDriveFolderRecursive(
+  folderId: string
+): Promise<DriveFileItem[]> {
+  const collectedImages: DriveFileItem[] = [];
+  const visitedFolders = new Set<string>();
+  let frontier: string[] = [folderId];
+
+  while (frontier.length > 0) {
+    const batch = frontier.filter((id) => {
+      if (visitedFolders.has(id)) return false;
+      visitedFolders.add(id);
+      return true;
+    });
+    if (batch.length === 0) break;
+
+    const childrenLists = await Promise.all(
+      batch.map((id) => listDriveImages('', id, 100))
+    );
+
+    const nextFrontier: string[] = [];
+    for (const children of childrenLists) {
+      for (const entry of children) {
+        if (isDriveFolder(entry)) {
+          if (!visitedFolders.has(entry.id)) {
+            nextFrontier.push(entry.id);
+          }
+        } else if (entry.mimeType?.startsWith('image/')) {
+          collectedImages.push(entry);
+        }
+      }
+    }
+    frontier = nextFrontier;
+  }
+
+  return collectedImages;
 }
 
 /**

@@ -6,9 +6,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   CheckSquare,
+  ChevronLeft,
+  ChevronRight,
   CloudDownload,
   CloudUpload,
   Download,
+  Eye,
   FileImage,
   Layers,
   LogOut,
@@ -17,6 +20,7 @@ import {
   Square,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import type { User } from 'firebase/auth';
 import {
@@ -34,7 +38,9 @@ import {
   downloadDriveImageAsDataUrl,
   DriveFileItem,
   getImageDimensions,
+  isDriveFolder,
   listDriveImages,
+  listImagesInDriveFolderRecursive,
   uploadImageToDrive,
 } from './lib/drive';
 import {
@@ -48,6 +54,7 @@ import {
 import { BatchImageItem } from './components/CanvasInspector';
 import {
   DriveImportModal,
+  DriveImportProgress,
   DriveUploadConfirmModal,
   GoogleSignInButton,
 } from './components/DriveModal';
@@ -65,6 +72,26 @@ const DEFAULT_BOTTOM_RIGHT_GEMINI_REGION: WatermarkRegion = {
 };
 
 const MAX_DETECT_HISTORY = 30;
+const PARALLEL_AI_WORKERS = 4;
+const PARALLEL_DRIVE_WORKERS = 5;
+const PARALLEL_EXPORT_WORKERS = 4;
+
+async function runWithConcurrency<T>(
+  list: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  if (list.length === 0) return;
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, list.length);
+  const runners = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < list.length) {
+      const currentIndex = nextIndex++;
+      await worker(list[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(runners);
+}
 
 // Snapshot of ONLY AI Watermark Detection state per image ID (never affects uploaded files)
 interface DetectionStateEntry {
@@ -113,6 +140,12 @@ export default function App() {
     useState<boolean>(false);
   const [isImportingFromDrive, setIsImportingFromDrive] =
     useState<boolean>(false);
+  const [driveImportProgress, setDriveImportProgress] =
+    useState<DriveImportProgress>({
+      completed: 0,
+      total: 0,
+      phase: 'downloading',
+    });
   const [driveError, setDriveError] = useState<string | null>(null);
 
   const [driveUploadItems, setDriveUploadItems] = useState<BatchImageItem[]>(
@@ -124,6 +157,12 @@ export default function App() {
     completed: 0,
     total: 0,
   });
+
+  // Image Preview Modal (opened via Eye button beside Detect)
+  const [previewItemId, setPreviewItemId] = useState<string | null>(null);
+  const [previewMode, setPreviewMode] = useState<'restored' | 'original'>(
+    'restored'
+  );
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -220,9 +259,33 @@ export default function App() {
     setStatusBanner('Redid Detect Watermarks (AI).');
   }, [detectRedoStack, items, isBatchProcessing, captureDetectionSnapshot]);
 
-  // Keyboard shortcuts for Undo/Redo of Detect Watermarks (AI)
+  // Keyboard shortcuts for Undo/Redo of Detect Watermarks (AI) and Preview Modal navigation
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (previewItemId) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setPreviewItemId(null);
+          return;
+        }
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+          const idx = items.findIndex((i) => i.id === previewItemId);
+          if (idx !== -1) {
+            const nextIdx =
+              e.key === 'ArrowRight'
+                ? Math.min(items.length - 1, idx + 1)
+                : Math.max(0, idx - 1);
+            if (nextIdx !== idx) {
+              e.preventDefault();
+              const target = items[nextIdx];
+              setPreviewItemId(target.id);
+              setPreviewMode(target.restoredDataUrl ? 'restored' : 'original');
+            }
+          }
+          return;
+        }
+      }
+
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -247,7 +310,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleUndoDetect, handleRedoDetect]);
+  }, [handleUndoDetect, handleRedoDetect, previewItemId, items]);
 
   // Initialize Firebase Auth listener & persist signed-in user across reloads
   useEffect(() => {
@@ -506,10 +569,7 @@ export default function App() {
       )
     );
 
-    let activeRegions = target.detectedRegions;
-    if (activeRegions.length === 0) {
-      activeRegions = await detectWatermarksForItem(target);
-    }
+    const activeRegions = target.detectedRegions;
 
     try {
       const base64 = target.originalDataUrl.split(',')[1];
@@ -525,12 +585,18 @@ export default function App() {
       });
 
       const data = await response.json().catch(() => ({}));
-      const refinedRegions: WatermarkRegion[] =
+      const aiRegions: WatermarkRegion[] =
         Array.isArray(data?.regions) && data.regions.length > 0
           ? data.regions
           : activeRegions.length > 0
           ? activeRegions
           : [DEFAULT_BOTTOM_RIGHT_GEMINI_REGION];
+
+      const refinedBottomRight = await refineBottomRightGeminiRegion(
+        target.originalDataUrl,
+        aiRegions
+      );
+      const refinedRegions = [refinedBottomRight];
 
       const restoredDataUrl = await performContentAwareInpaint(
         target.originalDataUrl,
@@ -616,7 +682,7 @@ export default function App() {
     );
   };
 
-  // Batch Restore Selected Images (or all if Apply to All is ON)
+  // Parallel Batch Restore Selected Images (or all if Apply to All is ON)
   const handleBatchRestoreSelected = async () => {
     const selected = items.filter((i) => i.selectedForBatch);
     const targets = applyToAll
@@ -630,15 +696,19 @@ export default function App() {
       pushDetectUndoSnapshot(items);
     }
     setIsBatchProcessing(true);
-    for (let idx = 0; idx < targets.length; idx++) {
-      const item = targets[idx];
-      setStatusBanner(
-        `Removing bottom-right Gemini watermark (${idx + 1} of ${
-          targets.length
-        }: ${item.name})...`
-      );
+    let completedCount = 0;
+    setStatusBanner(
+      `Removing bottom-right Gemini watermarks in parallel (0/${targets.length})...`
+    );
+
+    await runWithConcurrency(targets, PARALLEL_AI_WORKERS, async (item) => {
       await restoreSingleItem(item);
-    }
+      completedCount++;
+      setStatusBanner(
+        `Removing bottom-right Gemini watermarks in parallel (${completedCount}/${targets.length}: ${item.name})...`
+      );
+    });
+
     setIsBatchProcessing(false);
     setStatusBanner(
       `Removed bottom-right Gemini watermark across ${targets.length} image${
@@ -667,21 +737,45 @@ export default function App() {
     }
   };
 
-  // Bulk Export Images (Always Lossless PNG at 100% quality)
+  // Parallel Bulk Export Images (Always Lossless PNG at 100% quality)
   const handleBulkExportImages = async () => {
     const selected = items.filter((i) => i.selectedForBatch);
     const targets = selected.length > 0 ? selected : items;
     if (targets.length === 0) return;
 
     setStatusBanner(
-      `Exporting ${targets.length} lossless PNG image${
+      `Preparing ${targets.length} lossless PNG image${
         targets.length === 1 ? '' : 's'
-      } (100% quality)...`
+      } in parallel (100% quality)...`
     );
 
-    for (let i = 0; i < targets.length; i++) {
-      await handleExportSingleImage(targets[i]);
-      await new Promise((r) => setTimeout(r, 220));
+    const prepared: { blob: Blob; fileName: string }[] = new Array(
+      targets.length
+    );
+
+    await runWithConcurrency(
+      targets,
+      PARALLEL_EXPORT_WORKERS,
+      async (item, idx) => {
+        const sourceUrl = item.restoredDataUrl || item.originalDataUrl;
+        const { blob, extension } = await convertImageForExport(
+          sourceUrl,
+          EXPORT_FORMAT,
+          EXPORT_QUALITY
+        );
+        const cleanBaseName = item.name.replace(/\.[^/.]+$/, '');
+        prepared[idx] = {
+          blob,
+          fileName: `restored_${cleanBaseName}.${extension}`,
+        };
+      }
+    );
+
+    for (const file of prepared) {
+      if (file) {
+        triggerBlobDownload(file.blob, file.fileName);
+        await new Promise((r) => setTimeout(r, 120));
+      }
     }
 
     setStatusBanner(
@@ -704,17 +798,17 @@ export default function App() {
     await fetchDriveImageList('');
   };
 
-  const fetchDriveImageList = async (query: string) => {
+  const fetchDriveImageList = async (query: string, folderId?: string) => {
     setIsLoadingDriveFiles(true);
     setDriveError(null);
     try {
-      const list = await listDriveImages(query);
+      const list = await listDriveImages(query, folderId);
       setDriveFiles(list);
     } catch (err: any) {
       if (err?.message === 'AUTH_REQUIRED') {
         setNeedsDriveAuth(true);
       } else {
-        setDriveError(err?.message || 'Could not load Google Drive images.');
+        setDriveError(err?.message || 'Could not load Google Drive files.');
       }
     } finally {
       setIsLoadingDriveFiles(false);
@@ -727,30 +821,90 @@ export default function App() {
     setDriveError(null);
 
     try {
-      const imported: BatchImageItem[] = [];
-      for (let i = 0; i < selectedDriveFiles.length; i++) {
-        const df = selectedDriveFiles[i];
-        const downloaded = await downloadDriveImageAsDataUrl(
-          df.id,
-          df.mimeType
-        );
-        imported.push({
-          id: `drive_${df.id}_${Date.now()}_${i}`,
-          name: df.name,
-          source: 'drive',
-          driveFileId: df.id,
-          originalDataUrl: downloaded.dataUrl,
-          restoredDataUrl: null,
-          maskDataUrl: null,
-          mimeType: df.mimeType || 'image/png',
-          width: downloaded.width,
-          height: downloaded.height,
-          sizeBytes: downloaded.sizeBytes,
-          status: 'queued',
-          detectedRegions: [],
-          selectedForBatch: true,
-        });
+      // Expand any selected folders recursively into image files while preserving directly selected images
+      const resolvedMap = new Map<string, DriveFileItem>();
+      const selectedFolders = selectedDriveFiles.filter(isDriveFolder);
+      const selectedImages = selectedDriveFiles.filter(
+        (entry) => !isDriveFolder(entry)
+      );
+
+      for (const imgFile of selectedImages) {
+        resolvedMap.set(imgFile.id, imgFile);
       }
+
+      if (selectedFolders.length > 0) {
+        setDriveImportProgress({
+          completed: 0,
+          total: 0,
+          currentName:
+            selectedFolders.length === 1
+              ? selectedFolders[0].name
+              : `${selectedFolders.length} folders`,
+          phase: 'scanning',
+        });
+        const folderResults = await Promise.all(
+          selectedFolders.map((folder) =>
+            listImagesInDriveFolderRecursive(folder.id)
+          )
+        );
+        for (const folderImages of folderResults) {
+          for (const imgFile of folderImages) {
+            resolvedMap.set(imgFile.id, imgFile);
+          }
+        }
+      }
+
+      const filesToDownload = Array.from(resolvedMap.values());
+      if (filesToDownload.length === 0) {
+        setDriveError('No image files were found inside the selected folder.');
+        return;
+      }
+
+      setDriveImportProgress({
+        completed: 0,
+        total: filesToDownload.length,
+        currentName: filesToDownload[0]?.name,
+        phase: 'downloading',
+      });
+
+      const imported: BatchImageItem[] = new Array(filesToDownload.length);
+      let completedImports = 0;
+      const importTimestamp = Date.now();
+
+      await runWithConcurrency(
+        filesToDownload,
+        PARALLEL_DRIVE_WORKERS,
+        async (df, i) => {
+          const downloaded = await downloadDriveImageAsDataUrl(
+            df.id,
+            df.mimeType
+          );
+          imported[i] = {
+            id: `drive_${df.id}_${importTimestamp}_${i}`,
+            name: df.name,
+            source: 'drive',
+            driveFileId: df.id,
+            originalDataUrl: downloaded.dataUrl,
+            restoredDataUrl: null,
+            maskDataUrl: null,
+            mimeType: df.mimeType || 'image/png',
+            width: downloaded.width,
+            height: downloaded.height,
+            sizeBytes: downloaded.sizeBytes,
+            status: 'queued',
+            detectedRegions: [],
+            selectedForBatch: true,
+          };
+
+          completedImports++;
+          setDriveImportProgress({
+            completed: completedImports,
+            total: filesToDownload.length,
+            currentName: df.name,
+            phase: 'downloading',
+          });
+        }
+      );
 
       setItems((prev) => [...prev, ...imported]);
       if (imported.length > 0 && !activeId) {
@@ -794,35 +948,40 @@ export default function App() {
 
     try {
       const folder = await createDriveFolder('draft2');
+      let completedUploads = 0;
 
-      for (let i = 0; i < driveUploadItems.length; i++) {
-        const item = driveUploadItems[i];
-        const sourceUrl = item.restoredDataUrl || item.originalDataUrl;
-        const { dataUrl } = await convertImageForExport(
-          sourceUrl,
-          EXPORT_FORMAT,
-          EXPORT_QUALITY
-        );
+      await runWithConcurrency(
+        driveUploadItems,
+        PARALLEL_DRIVE_WORKERS,
+        async (item) => {
+          const sourceUrl = item.restoredDataUrl || item.originalDataUrl;
+          const { dataUrl } = await convertImageForExport(
+            sourceUrl,
+            EXPORT_FORMAT,
+            EXPORT_QUALITY
+          );
 
-        const uploaded = await uploadImageToDrive(
-          item.name,
-          dataUrl,
-          EXPORT_FORMAT,
-          folder.id
-        );
-        await markJobExportedToDriveInFirestore(item.id, uploaded.id, {
-          fileName: item.name,
-          source: item.source,
-          width: item.width,
-          height: item.height,
-          regionCount: item.detectedRegions.length,
-        });
+          const uploaded = await uploadImageToDrive(
+            item.name,
+            dataUrl,
+            EXPORT_FORMAT,
+            folder.id
+          );
+          await markJobExportedToDriveInFirestore(item.id, uploaded.id, {
+            fileName: item.name,
+            source: item.source,
+            width: item.width,
+            height: item.height,
+            regionCount: item.detectedRegions.length,
+          });
 
-        setDriveUploadProgress({
-          completed: i + 1,
-          total: driveUploadItems.length,
-        });
-      }
+          completedUploads++;
+          setDriveUploadProgress({
+            completed: completedUploads,
+            total: driveUploadItems.length,
+          });
+        }
+      );
 
       setIsDriveUploadOpen(false);
       setStatusBanner(
@@ -855,6 +1014,11 @@ export default function App() {
     }
     return true;
   });
+
+  const previewIndex = previewItemId
+    ? items.findIndex((i) => i.id === previewItemId)
+    : -1;
+  const previewItem = previewIndex >= 0 ? items[previewIndex] : null;
 
   return (
     <div
@@ -1143,6 +1307,22 @@ export default function App() {
                       <div className="flex items-center gap-2 shrink-0">
                         <button
                           type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPreviewMode(
+                              item.restoredDataUrl ? 'restored' : 'original'
+                            );
+                            setPreviewItemId(item.id);
+                          }}
+                          className="p-1.5 text-slate-600 bg-slate-100 hover:bg-slate-200 hover:text-slate-900 rounded-md transition-colors shrink-0 cursor-pointer"
+                          title="View image"
+                          aria-label={`View ${item.name}`}
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                        </button>
+
+                        <button
+                          type="button"
                           disabled={
                             item.status === 'detecting' ||
                             item.status === 'restoring' ||
@@ -1250,6 +1430,7 @@ export default function App() {
         files={driveFiles}
         isLoadingFiles={isLoadingDriveFiles}
         isImporting={isImportingFromDrive}
+        importProgress={driveImportProgress}
         error={driveError}
         onSearchFiles={fetchDriveImageList}
         onImportSelected={handleImportDriveFiles}
@@ -1261,9 +1442,21 @@ export default function App() {
             .filter(Boolean);
           if (lines.length === 0) return;
 
+          setDriveImportProgress({
+            completed: 0,
+            total: lines.length,
+            phase: 'downloading',
+          });
+
           const imported: BatchImageItem[] = [];
           for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
+            setDriveImportProgress({
+              completed: i,
+              total: lines.length,
+              currentName: `Shared link ${i + 1}`,
+              phase: 'downloading',
+            });
             const resp = await fetch('/api/drive/fetch-shared', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -1290,6 +1483,12 @@ export default function App() {
               status: 'queued',
               detectedRegions: [],
               selectedForBatch: true,
+            });
+            setDriveImportProgress({
+              completed: i + 1,
+              total: lines.length,
+              currentName: data.name,
+              phase: 'downloading',
             });
           }
 
@@ -1321,6 +1520,148 @@ export default function App() {
         uploadProgress={driveUploadProgress}
         onConfirmUpload={handleConfirmDriveBulkUpload}
       />
+
+      {/* Image Preview Modal (opened via Eye button beside Detect) */}
+      {previewItem && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 backdrop-blur-xs p-4"
+          onClick={() => setPreviewItemId(null)}
+        >
+          <div
+            className="bg-white border border-slate-200 rounded-2xl shadow-2xl max-w-4xl w-full overflow-hidden flex flex-col max-h-[90vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3.5 border-b border-slate-200 bg-white">
+              <div className="min-w-0 flex items-center gap-3">
+                {items.length > 1 && (
+                  <div className="flex items-center bg-slate-100 border border-slate-200 rounded-lg overflow-hidden shrink-0">
+                    <button
+                      type="button"
+                      disabled={previewIndex <= 0}
+                      onClick={() => {
+                        const prev = items[previewIndex - 1];
+                        if (prev) {
+                          setPreviewItemId(prev.id);
+                          setPreviewMode(
+                            prev.restoredDataUrl ? 'restored' : 'original'
+                          );
+                        }
+                      }}
+                      className="p-1.5 text-slate-700 hover:bg-white disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer"
+                      aria-label="Previous image"
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </button>
+                    <span className="px-2 text-xs font-mono tabular-nums text-slate-700">
+                      {previewIndex + 1} / {items.length}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={previewIndex >= items.length - 1}
+                      onClick={() => {
+                        const next = items[previewIndex + 1];
+                        if (next) {
+                          setPreviewItemId(next.id);
+                          setPreviewMode(
+                            next.restoredDataUrl ? 'restored' : 'original'
+                          );
+                        }
+                      }}
+                      className="p-1.5 text-slate-700 hover:bg-white disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer"
+                      aria-label="Next image"
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold text-slate-900 truncate max-w-xs sm:max-w-md">
+                    {previewItem.name}
+                  </h3>
+                  <p className="text-[11px] font-mono tabular-nums text-slate-500">
+                    {previewItem.width}×{previewItem.height} px ·{' '}
+                    {(previewItem.sizeBytes / 1024).toFixed(0)} KB
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                {previewItem.restoredDataUrl && (
+                  <div className="flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setPreviewMode('restored')}
+                      className={`px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer ${
+                        previewMode === 'restored'
+                          ? 'bg-white text-blue-700 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Restored
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewMode('original')}
+                      className={`px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer ${
+                        previewMode === 'original'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Original
+                    </button>
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => setPreviewItemId(null)}
+                  className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                  aria-label="Close image preview"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Image Canvas */}
+            <div className="flex-1 bg-slate-950 flex items-center justify-center p-4 overflow-auto min-h-[320px]">
+              <div className="relative inline-block max-w-full">
+                <img
+                  src={
+                    previewMode === 'restored' && previewItem.restoredDataUrl
+                      ? previewItem.restoredDataUrl
+                      : previewItem.originalDataUrl
+                  }
+                  alt={previewItem.name}
+                  referrerPolicy="no-referrer"
+                  className="block max-w-full max-h-[72vh] w-auto h-auto object-contain rounded-md"
+                />
+                {(previewMode === 'original' || !previewItem.restoredDataUrl) &&
+                  previewItem.detectedRegions.map((reg, idx) => (
+                    <div
+                      key={`${reg.label}-${idx}`}
+                      style={{
+                        top: `${(reg.ymin / 1000) * 100}%`,
+                        left: `${(reg.xmin / 1000) * 100}%`,
+                        height: `${Math.max(
+                          2,
+                          ((reg.ymax - reg.ymin) / 1000) * 100
+                        )}%`,
+                        width: `${Math.max(
+                          2,
+                          ((reg.xmax - reg.xmin) / 1000) * 100
+                        )}%`,
+                      }}
+                      className="absolute border-2 border-amber-400 bg-amber-400/15 pointer-events-none"
+                    />
+                  ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

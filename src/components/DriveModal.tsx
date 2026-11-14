@@ -1,9 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   CheckSquare,
+  ChevronRight,
   CloudDownload,
   CloudUpload,
   ExternalLink,
+  Folder,
   FolderOpen,
   Link2,
   RefreshCw,
@@ -11,7 +13,7 @@ import {
   Square,
   X,
 } from 'lucide-react';
-import { DriveFileItem } from '../lib/drive';
+import { DriveFileItem, isDriveFolder } from '../lib/drive';
 import { BatchImageItem } from './CanvasInspector';
 import { ExportImageFormat } from '../lib/inpaint';
 
@@ -60,6 +62,18 @@ export const GoogleSignInButton: React.FC<{
   </button>
 );
 
+export interface DriveImportProgress {
+  completed: number;
+  total: number;
+  currentName?: string;
+  phase?: 'scanning' | 'downloading';
+}
+
+interface DriveFolderCrumb {
+  id: string;
+  name: string;
+}
+
 interface DriveImportModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -69,8 +83,9 @@ interface DriveImportModalProps {
   files: DriveFileItem[];
   isLoadingFiles: boolean;
   isImporting: boolean;
+  importProgress: DriveImportProgress;
   error: string | null;
-  onSearchFiles: (query: string) => void;
+  onSearchFiles: (query: string, folderId?: string) => void;
   onImportSelected: (selectedFiles: DriveFileItem[]) => void;
   onImportSharedLinks?: (linksText: string) => Promise<void>;
 }
@@ -84,34 +99,84 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
   files,
   isLoadingFiles,
   isImporting,
+  importProgress,
   error,
   onSearchFiles,
   onImportSelected,
   onImportSharedLinks,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
+  const [selectedItemsMap, setSelectedItemsMap] = useState<
+    Record<string, DriveFileItem>
+  >({});
+  const [folderPath, setFolderPath] = useState<DriveFolderCrumb[]>([]);
   const [sharedLinksInput, setSharedLinksInput] = useState('');
   const [isFetchingLinks, setIsFetchingLinks] = useState(false);
 
+  useEffect(() => {
+    if (isOpen) {
+      setSelectedItemsMap({});
+      setFolderPath([]);
+      setSearchQuery('');
+    }
+  }, [isOpen]);
+
   if (!isOpen) return null;
 
-  const toggleSelect = (id: string) => {
-    setSelectedIds((prev) => ({ ...prev, [id]: !prev[id] }));
+  const currentFolderId =
+    folderPath.length > 0 ? folderPath[folderPath.length - 1].id : undefined;
+
+  const toggleSelect = (file: DriveFileItem) => {
+    setSelectedItemsMap((prev) => {
+      const next = { ...prev };
+      if (next[file.id]) {
+        delete next[file.id];
+      } else {
+        next[file.id] = file;
+      }
+      return next;
+    });
   };
 
-  const selectedFiles = files.filter((f) => selectedIds[f.id]);
+  const selectedFiles = Object.values(selectedItemsMap);
+  const selectedFoldersCount = selectedFiles.filter(isDriveFolder).length;
+  const selectedImagesCount = selectedFiles.length - selectedFoldersCount;
+
+  const allVisibleSelected =
+    files.length > 0 && files.every((f) => Boolean(selectedItemsMap[f.id]));
 
   const handleSelectAll = () => {
-    if (selectedFiles.length === files.length) {
-      setSelectedIds({});
-    } else {
-      const next: Record<string, boolean> = {};
-      files.forEach((f) => {
-        next[f.id] = true;
-      });
-      setSelectedIds(next);
+    setSelectedItemsMap((prev) => {
+      const next = { ...prev };
+      if (allVisibleSelected) {
+        files.forEach((f) => {
+          delete next[f.id];
+        });
+      } else {
+        files.forEach((f) => {
+          next[f.id] = f;
+        });
+      }
+      return next;
+    });
+  };
+
+  const handleOpenFolder = (folder: DriveFileItem) => {
+    setSearchQuery('');
+    setFolderPath((prev) => [...prev, { id: folder.id, name: folder.name }]);
+    onSearchFiles('', folder.id);
+  };
+
+  const handleNavigateBreadcrumb = (index: number) => {
+    setSearchQuery('');
+    if (index < 0) {
+      setFolderPath([]);
+      onSearchFiles('', undefined);
+      return;
     }
+    const nextPath = folderPath.slice(0, index + 1);
+    setFolderPath(nextPath);
+    onSearchFiles('', nextPath[nextPath.length - 1].id);
   };
 
   const handleSharedLinksSubmit = async () => {
@@ -125,6 +190,15 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
     }
   };
 
+  const isProgressActive = isImporting || isFetchingLinks;
+  const progressPercent =
+    importProgress.total > 0
+      ? Math.min(
+          100,
+          Math.round((importProgress.completed / importProgress.total) * 100)
+        )
+      : 0;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
       <div className="bg-white border border-slate-200 rounded-xl shadow-xl w-full max-w-2xl overflow-hidden flex flex-col max-h-[88vh]">
@@ -133,13 +207,14 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
           <div className="flex items-center gap-2.5">
             <FolderOpen className="w-5 h-5 text-blue-600" />
             <h3 className="text-base font-semibold text-slate-900">
-              Upload Images from Google Drive
+              Upload Images or Folders from Google Drive
             </h3>
           </div>
           <button
             type="button"
+            disabled={isProgressActive}
             onClick={onClose}
-            className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg transition-colors"
+            className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg transition-colors disabled:opacity-40"
           >
             <X className="w-4 h-4" />
           </button>
@@ -215,7 +290,7 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
                 </ol>
               </div>
 
-              {/* Alternative: Direct Shared Google Drive Link Import (works without OAuth popup!) */}
+              {/* Alternative: Direct Shared Google Drive Link Import */}
               {onImportSharedLinks && (
                 <div className="pt-2 border-t border-slate-200 space-y-2.5">
                   <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
@@ -269,17 +344,19 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter') onSearchFiles(searchQuery);
+                      if (e.key === 'Enter') {
+                        onSearchFiles(searchQuery, currentFolderId);
+                      }
                     }}
-                    placeholder="Search images in your Google Drive..."
+                    placeholder="Search folders or images in your Google Drive..."
                     className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600"
                   />
                 </div>
                 <button
                   type="button"
-                  onClick={() => onSearchFiles(searchQuery)}
-                  disabled={isLoadingFiles}
-                  className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                  onClick={() => onSearchFiles(searchQuery, currentFolderId)}
+                  disabled={isLoadingFiles || isProgressActive}
+                  className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <RefreshCw
                     className={`w-3.5 h-3.5 ${
@@ -291,14 +368,49 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
                 {files.length > 0 && (
                   <button
                     type="button"
+                    disabled={isProgressActive}
                     onClick={handleSelectAll}
-                    className="px-3 py-2 text-xs font-medium text-blue-700 hover:bg-blue-50 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                    className="px-3 py-2 text-xs font-medium text-blue-700 hover:bg-blue-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    {selectedFiles.length === files.length
-                      ? 'Deselect All'
-                      : 'Select All'}
+                    {allVisibleSelected ? 'Deselect All' : 'Select All'}
                   </button>
                 )}
+              </div>
+
+              {/* Folder Breadcrumbs */}
+              <div className="flex items-center flex-wrap gap-1 text-xs text-slate-600">
+                <button
+                  type="button"
+                  disabled={isProgressActive}
+                  onClick={() => handleNavigateBreadcrumb(-1)}
+                  className={`px-2 py-1 rounded hover:bg-slate-100 transition-colors cursor-pointer ${
+                    folderPath.length === 0
+                      ? 'font-semibold text-slate-900 bg-slate-100'
+                      : 'text-blue-700'
+                  }`}
+                >
+                  Google Drive
+                </button>
+                {folderPath.map((crumb, idx) => (
+                  <React.Fragment key={crumb.id}>
+                    <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                    <button
+                      type="button"
+                      disabled={isProgressActive}
+                      onClick={() => handleNavigateBreadcrumb(idx)}
+                      className={`px-2 py-1 rounded hover:bg-slate-100 transition-colors cursor-pointer ${
+                        idx === folderPath.length - 1
+                          ? 'font-semibold text-slate-900 bg-slate-100'
+                          : 'text-blue-700'
+                      }`}
+                    >
+                      {crumb.name}
+                    </button>
+                  </React.Fragment>
+                ))}
+                <span className="ml-auto text-[11px] text-slate-500">
+                  Tip: Check a folder to import all images inside it
+                </span>
               </div>
 
               {error && (
@@ -307,7 +419,7 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
                 </div>
               )}
 
-              {/* File List */}
+              {/* File & Folder List */}
               {isLoadingFiles ? (
                 <div className="space-y-2 py-6">
                   {[1, 2, 3, 4].map((n) => (
@@ -319,19 +431,20 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
                 </div>
               ) : files.length === 0 ? (
                 <div className="py-10 text-center text-xs text-slate-500">
-                  No image files found in your Google Drive matching this query.
+                  No folders or image files found in this Google Drive location.
                 </div>
               ) : (
                 <div className="border border-slate-200 rounded-lg divide-y divide-slate-200 max-h-80 overflow-y-auto">
                   {files.map((file) => {
-                    const isChecked = !!selectedIds[file.id];
+                    const isFolder = isDriveFolder(file);
+                    const isChecked = Boolean(selectedItemsMap[file.id]);
                     const sizeKb = file.size
                       ? `${Math.round(Number(file.size) / 1024)} KB`
                       : 'Image';
                     return (
                       <div
                         key={file.id}
-                        onClick={() => toggleSelect(file.id)}
+                        onClick={() => !isProgressActive && toggleSelect(file)}
                         className={`flex items-center justify-between gap-3 px-4 py-2.5 cursor-pointer transition-colors ${
                           isChecked ? 'bg-blue-50/70' : 'hover:bg-slate-50'
                         }`}
@@ -342,7 +455,11 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
                           ) : (
                             <Square className="w-4 h-4 text-slate-400 shrink-0" />
                           )}
-                          {file.thumbnailLink ? (
+                          {isFolder ? (
+                            <div className="w-8 h-8 rounded bg-amber-50 border border-amber-200 flex items-center justify-center shrink-0">
+                              <Folder className="w-4 h-4 text-amber-600" />
+                            </div>
+                          ) : file.thumbnailLink ? (
                             <img
                               src={file.thumbnailLink}
                               alt={file.name}
@@ -352,16 +469,42 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
                           ) : (
                             <div className="w-8 h-8 rounded bg-slate-100 border border-slate-200 shrink-0" />
                           )}
-                          <span className="text-xs font-medium text-slate-900 truncate">
-                            {file.name}
-                          </span>
+                          <div className="min-w-0">
+                            <span className="text-xs font-medium text-slate-900 truncate block">
+                              {file.name}
+                            </span>
+                            {isFolder && (
+                              <span className="text-[11px] text-slate-500">
+                                Folder (imports all images inside)
+                              </span>
+                            )}
+                          </div>
                         </div>
+
                         <div className="flex items-center gap-2 text-xs text-slate-500 font-mono tabular-nums shrink-0">
-                          <span>{sizeKb}</span>
-                          <span aria-hidden="true">·</span>
-                          <span>
-                            {file.mimeType.replace('image/', '').toUpperCase()}
-                          </span>
+                          {isFolder ? (
+                            <button
+                              type="button"
+                              disabled={isProgressActive}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleOpenFolder(file);
+                              }}
+                              className="px-2.5 py-1 text-xs font-sans font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-md transition-colors cursor-pointer"
+                            >
+                              Open
+                            </button>
+                          ) : (
+                            <>
+                              <span>{sizeKb}</span>
+                              <span aria-hidden="true">·</span>
+                              <span>
+                                {file.mimeType
+                                  .replace('image/', '')
+                                  .toUpperCase()}
+                              </span>
+                            </>
+                          )}
                         </div>
                       </div>
                     );
@@ -370,35 +513,83 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
               )}
             </div>
           )}
+
+          {/* Upload/Import Progress Bar */}
+          {isProgressActive && (
+            <div className="p-4 rounded-xl bg-blue-50/70 border border-blue-200 space-y-2">
+              <div className="flex items-center justify-between gap-2 text-xs font-medium text-slate-800">
+                <span className="truncate">
+                  {importProgress.phase === 'scanning'
+                    ? `Scanning folder "${importProgress.currentName || ''}" for images...`
+                    : importProgress.currentName
+                    ? `Uploading from Drive: ${importProgress.currentName}`
+                    : 'Uploading images from Google Drive...'}
+                </span>
+                <span className="font-mono tabular-nums text-blue-700 shrink-0">
+                  {importProgress.phase === 'scanning'
+                    ? 'Preparing...'
+                    : `${importProgress.completed} / ${importProgress.total} (${progressPercent}%)`}
+                </span>
+              </div>
+              <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
+                <div
+                  className={`h-full bg-blue-600 transition-all duration-200 ${
+                    importProgress.phase === 'scanning'
+                      ? 'w-1/3 animate-pulse'
+                      : ''
+                  }`}
+                  style={
+                    importProgress.phase === 'scanning'
+                      ? undefined
+                      : { width: `${progressPercent}%` }
+                  }
+                />
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Footer */}
         <div className="flex items-center justify-between px-6 py-4 border-t border-slate-200 bg-slate-50">
           <span className="text-xs text-slate-600 font-mono tabular-nums">
-            {selectedFiles.length} image{selectedFiles.length === 1 ? '' : 's'}{' '}
-            selected
+            {selectedFoldersCount > 0 && selectedImagesCount > 0
+              ? `${selectedFoldersCount} folder${
+                  selectedFoldersCount === 1 ? '' : 's'
+                }, ${selectedImagesCount} image${
+                  selectedImagesCount === 1 ? '' : 's'
+                } selected`
+              : selectedFoldersCount > 0
+              ? `${selectedFoldersCount} folder${
+                  selectedFoldersCount === 1 ? '' : 's'
+                } selected`
+              : `${selectedImagesCount} image${
+                  selectedImagesCount === 1 ? '' : 's'
+                } selected`}
           </span>
           <div className="flex items-center gap-2.5">
             <button
               type="button"
+              disabled={isProgressActive}
               onClick={onClose}
-              className="px-4 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors"
+              className="px-4 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors disabled:opacity-50"
             >
               Cancel
             </button>
             {!needsAuth && (
               <button
                 type="button"
-                disabled={selectedFiles.length === 0 || isImporting}
+                disabled={selectedFiles.length === 0 || isProgressActive}
                 onClick={() => onImportSelected(selectedFiles)}
-                className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50"
+                className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
               >
                 <CloudDownload className="w-4 h-4" />
                 {isImporting
-                  ? 'Importing from Drive...'
-                  : `Import ${selectedFiles.length || ''} Image${
-                      selectedFiles.length === 1 ? '' : 's'
-                    }`}
+                  ? importProgress.phase === 'scanning'
+                    ? 'Scanning Folder...'
+                    : `Uploading (${importProgress.completed}/${importProgress.total})...`
+                  : selectedFoldersCount > 0 && selectedImagesCount === 0
+                  ? `Import Folder${selectedFoldersCount === 1 ? '' : 's'} (${selectedFoldersCount})`
+                  : `Import Selected (${selectedFiles.length})`}
               </button>
             )}
           </div>
