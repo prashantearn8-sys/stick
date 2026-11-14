@@ -1,0 +1,95 @@
+{
+  "entities": {
+    "RestorationJob": {
+      "title": "RestorationJob",
+      "description": "Metadata record of an AI watermark detection and image restoration job owned by an authenticated user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "The Firebase Auth UID of the job owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fileName": {
+          "type": "string",
+          "description": "Original image file name.",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "source": {
+          "type": "string",
+          "description": "Origin of the image (local or drive).",
+          "enum": ["local", "drive"]
+        },
+        "width": {
+          "type": "integer",
+          "description": "Width of the image in pixels."
+        },
+        "height": {
+          "type": "integer",
+          "description": "Height of the image in pixels."
+        },
+        "regionCount": {
+          "type": "integer",
+          "description": "Number of watermark regions detected."
+        },
+        "watermarkType": {
+          "type": "string",
+          "description": "Detected watermark classification.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "restorationMethod": {
+          "type": "string",
+          "description": "Restoration engine or algorithm applied.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "status": {
+          "type": "string",
+          "description": "Processing status of the job.",
+          "enum": ["detected", "restored", "exported_drive"]
+        },
+        "driveFileId": {
+          "type": "string",
+          "description": "Optional Google Drive file ID if imported or exported.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the job record was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the job record was last updated."
+        }
+      },
+      "required": [
+        "ownerId",
+        "fileName",
+        "source",
+        "width",
+        "height",
+        "regionCount",
+        "watermarkType",
+        "restorationMethod",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/restorationJobs/{jobId}": {
+      "schema": {
+        "$ref": "#/entities/RestorationJob"
+      },
+      "description": "Per-user watermark removal and restoration job history records."
+    }
+  }
+}

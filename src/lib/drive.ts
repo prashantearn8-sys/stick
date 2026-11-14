@@ -1,4 +1,4 @@
-import { getAccessToken } from './auth';
+import { clearCachedAccessToken, getAccessToken } from './auth';
 
 export interface DriveFileItem {
   id: string;
@@ -11,11 +11,11 @@ export interface DriveFileItem {
 }
 
 /**
- * Lists image files from the user's Google Drive.
+ * Lists image files from the user's Google Drive with automatic pagination for unlimited image batches.
  */
 export async function listDriveImages(
   searchQuery = '',
-  pageSize = 30
+  pageSize = 100
 ): Promise<DriveFileItem[]> {
   const token = await getAccessToken();
   if (!token) {
@@ -28,36 +28,52 @@ export async function listDriveImages(
     q += ` and name contains '${escaped}'`;
   }
 
-  const params = new URLSearchParams({
-    q,
-    pageSize: String(pageSize),
-    orderBy: 'modifiedTime desc',
-    fields:
-      'files(id,name,mimeType,size,modifiedTime,thumbnailLink,webViewLink)',
-  });
+  const allFiles: DriveFileItem[] = [];
+  let pageToken: string | undefined = undefined;
+  let pagesFetched = 0;
 
-  const res = await fetch(
-    `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+  do {
+    const params = new URLSearchParams({
+      q,
+      pageSize: String(pageSize),
+      orderBy: 'modifiedTime desc',
+      fields:
+        'nextPageToken,files(id,name,mimeType,size,modifiedTime,thumbnailLink,webViewLink)',
+    });
+    if (pageToken) {
+      params.set('pageToken', pageToken);
     }
-  );
 
-  if (res.status === 401 || res.status === 403) {
-    throw new Error('AUTH_REQUIRED');
-  }
-
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(
-      errData?.error?.message || 'Failed to fetch images from Google Drive.'
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      }
     );
-  }
 
-  const data = await res.json();
-  return data.files || [];
+    if (res.status === 401 || res.status === 403) {
+      clearCachedAccessToken();
+      throw new Error('AUTH_REQUIRED');
+    }
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(
+        errData?.error?.message || 'Failed to fetch images from Google Drive.'
+      );
+    }
+
+    const data = await res.json();
+    if (Array.isArray(data.files)) {
+      allFiles.push(...data.files);
+    }
+    pageToken = data.nextPageToken;
+    pagesFetched++;
+  } while (pageToken && pagesFetched < 10);
+
+  return allFiles;
 }
 
 /**
@@ -82,6 +98,7 @@ export async function downloadDriveImageAsDataUrl(
   );
 
   if (res.status === 401 || res.status === 403) {
+    clearCachedAccessToken();
     throw new Error('AUTH_REQUIRED');
   }
 
@@ -110,12 +127,55 @@ export async function downloadDriveImageAsDataUrl(
 }
 
 /**
+ * Creates a new folder in the user's Google Drive.
+ */
+export async function createDriveFolder(
+  folderName: string
+): Promise<{ id: string; name: string }> {
+  const token = await getAccessToken();
+  if (!token) {
+    throw new Error('AUTH_REQUIRED');
+  }
+
+  const res = await fetch(
+    'https://www.googleapis.com/drive/v3/files?fields=id,name',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: folderName,
+        mimeType: 'application/vnd.google-apps.folder',
+      }),
+    }
+  );
+
+  if (res.status === 401 || res.status === 403) {
+    clearCachedAccessToken();
+    throw new Error('AUTH_REQUIRED');
+  }
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(
+      errData?.error?.message ||
+        `Failed to create folder "${folderName}" in Google Drive.`
+    );
+  }
+
+  return await res.json();
+}
+
+/**
  * Uploads a single exported image (from dataUrl) to the user's Google Drive.
  */
 export async function uploadImageToDrive(
   fileName: string,
   dataUrl: string,
-  mimeType: string
+  mimeType: string,
+  parentFolderId?: string
 ): Promise<{ id: string; name: string; webViewLink?: string }> {
   const token = await getAccessToken();
   if (!token) {
@@ -130,11 +190,20 @@ export async function uploadImageToDrive(
   }
   const fileBlob = new Blob([byteArrays], { type: mimeType });
 
-  const metadata = {
+  const metadata: {
+    name: string;
+    mimeType: string;
+    description: string;
+    parents?: string[];
+  } = {
     name: fileName,
     mimeType,
     description: 'Restored and exported image via ClearSlate Studio',
   };
+
+  if (parentFolderId) {
+    metadata.parents = [parentFolderId];
+  }
 
   const form = new FormData();
   form.append(
@@ -155,6 +224,7 @@ export async function uploadImageToDrive(
   );
 
   if (res.status === 401 || res.status === 403) {
+    clearCachedAccessToken();
     throw new Error('AUTH_REQUIRED');
   }
 

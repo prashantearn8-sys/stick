@@ -176,7 +176,7 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
                   <li>
                     Open your project&apos;s{' '}
                     <a
-                      href="https://console.cloud.google.com/auth/audience?project=gen-lang-client-0874742767"
+                      href="https://console.cloud.google.com/auth/audience?project=stickmuse"
                       target="_blank"
                       rel="noreferrer"
                       className="text-blue-600 font-medium underline inline-flex items-center gap-1"
@@ -202,7 +202,7 @@ export const DriveImportModal: React.FC<DriveImportModalProps> = ({
                     </code>
                     ) is listed under{' '}
                     <a
-                      href="https://console.firebase.google.com/project/gen-lang-client-0874742767/authentication/settings"
+                      href="https://console.firebase.google.com/project/stickmuse/authentication/settings"
                       target="_blank"
                       rel="noreferrer"
                       className="text-blue-600 font-medium underline inline-flex items-center gap-1"
@@ -473,13 +473,14 @@ export const DriveUploadConfirmModal: React.FC<DriveUploadConfirmModalProps> = (
           ) : (
             <>
               <p className="text-xs text-slate-600 leading-relaxed">
-                You are about to create and upload{' '}
+                You are about to create a new folder named{' '}
+                <strong className="text-slate-900 font-mono">draft2</strong> in
+                your Google Drive and export{' '}
                 <strong className="text-slate-900 font-mono tabular-nums">
                   {itemsToUpload.length}
                 </strong>{' '}
-                image file{itemsToUpload.length === 1 ? '' : 's'} (formatted as{' '}
-                <strong className="text-slate-900">{formatLabel}</strong>) to
-                your Google Drive. Please confirm to proceed:
+                image file{itemsToUpload.length === 1 ? '' : 's'} ({formatLabel})
+                with the exact original filename{itemsToUpload.length === 1 ? '' : 's'}. Please confirm to proceed:
               </p>
 
               <div className="border border-slate-200 rounded-lg divide-y divide-slate-200 max-h-48 overflow-y-auto bg-slate-50/50">
@@ -489,10 +490,7 @@ export const DriveUploadConfirmModal: React.FC<DriveUploadConfirmModalProps> = (
                     className="px-3.5 py-2 flex items-center justify-between text-xs"
                   >
                     <span className="font-medium text-slate-800 truncate max-w-xs">
-                      restored_{item.name.replace(/\.[^/.]+$/, '')}.
-                      {formatLabel.toLowerCase() === 'jpeg'
-                        ? 'jpg'
-                        : formatLabel.toLowerCase()}
+                      draft2/{item.name}
                     </span>
                     <span className="text-slate-500 font-mono tabular-nums">
                       {item.restoredDataUrl ? 'Restored Image' : 'Original Image'}
