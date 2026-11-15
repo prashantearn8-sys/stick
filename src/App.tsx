@@ -15,6 +15,7 @@ import {
   FileImage,
   Layers,
   LogOut,
+  Maximize2,
   Search,
   Sparkles,
   Square,
@@ -46,11 +47,13 @@ import {
 import {
   convertImageForExport,
   ExportImageFormat,
+  extractBottomRightCornerCrop,
   performContentAwareInpaint,
   refineBottomRightGeminiRegion,
   triggerBlobDownload,
   WatermarkRegion,
 } from './lib/inpaint';
+import { upscaleImageTo5K } from './lib/upscale';
 import { BatchImageItem } from './components/CanvasInspector';
 import {
   DriveImportModal,
@@ -73,6 +76,7 @@ const DEFAULT_BOTTOM_RIGHT_GEMINI_REGION: WatermarkRegion = {
 
 const MAX_DETECT_HISTORY = 30;
 const PARALLEL_AI_WORKERS = 4;
+const PARALLEL_UPSCALE_WORKERS = 2;
 const PARALLEL_DRIVE_WORKERS = 5;
 const PARALLEL_EXPORT_WORKERS = 4;
 
@@ -461,13 +465,14 @@ export default function App() {
     );
 
     try {
-      const base64 = target.originalDataUrl.split(',')[1];
+      const crop = await extractBottomRightCornerCrop(target.originalDataUrl);
       const response = await fetch('/api/watermark/detect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          imageBase64: base64,
-          mimeType: target.mimeType || 'image/png',
+          cornerCropBase64: crop.cornerCropBase64,
+          cornerMimeType: crop.cornerMimeType,
+          cropBounds: crop.cropBounds,
         }),
       });
 
@@ -569,16 +574,21 @@ export default function App() {
       )
     );
 
+    const sourceForRestore =
+      target.upscaled5k && target.restoredDataUrl
+        ? target.restoredDataUrl
+        : target.originalDataUrl;
     const activeRegions = target.detectedRegions;
 
     try {
-      const base64 = target.originalDataUrl.split(',')[1];
+      const crop = await extractBottomRightCornerCrop(sourceForRestore);
       const response = await fetch('/api/watermark/restore', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          imageBase64: base64,
-          mimeType: target.mimeType || 'image/png',
+          cornerCropBase64: crop.cornerCropBase64,
+          cornerMimeType: crop.cornerMimeType,
+          cropBounds: crop.cropBounds,
           mode: 'high_quality',
           detectedRegions: activeRegions,
         }),
@@ -593,19 +603,24 @@ export default function App() {
           : [DEFAULT_BOTTOM_RIGHT_GEMINI_REGION];
 
       const refinedBottomRight = await refineBottomRightGeminiRegion(
-        target.originalDataUrl,
+        sourceForRestore,
         aiRegions
       );
       const refinedRegions = [refinedBottomRight];
 
       const restoredDataUrl = await performContentAwareInpaint(
-        target.originalDataUrl,
+        sourceForRestore,
         refinedRegions,
-        null
+        null,
+        {
+          backgroundStyle: data?.backgroundStyle,
+          sparklePolarity: data?.sparklePolarity,
+          estimatedOpacity: data?.estimatedOpacity,
+        }
       );
 
       const methodLabel =
-        'AI-Guided Structure-Preserving Inpaint (Gemini AI)';
+        'AI-Guided Structure + Patch-Match Inpaint (Gemini AI)';
       const wmType =
         data?.watermarkType ||
         target.watermarkType ||
@@ -714,6 +729,119 @@ export default function App() {
       `Removed bottom-right Gemini watermark across ${targets.length} image${
         targets.length === 1 ? '' : 's'
       }.`
+    );
+  };
+
+  // Single Image 5K AI Upscaler (Gemini AI Content Analysis + Lanczos-3 5120px Super-Resolution)
+  const upscaleSingleItem = async (target: BatchImageItem): Promise<void> => {
+    const previousStatus = target.status;
+    setItems((prev) =>
+      prev.map((item) =>
+        item.id === target.id
+          ? { ...item, status: 'upscaling', errorMessage: undefined }
+          : item
+      )
+    );
+
+    try {
+      const sourceUrl = target.restoredDataUrl || target.originalDataUrl;
+      const result = await upscaleImageTo5K(sourceUrl);
+      const methodLabel = target.restoredDataUrl
+        ? 'Watermark Removed + 5K AI Upscaled (5120px)'
+        : '5K AI Super-Resolution (5120px)';
+
+      setItems((prev) =>
+        prev.map((item) =>
+          item.id === target.id
+            ? {
+                ...item,
+                status: 'restored',
+                restoredDataUrl: result.dataUrl,
+                sizeBytes: result.sizeBytes,
+                upscaled5k: true,
+                upscaledWidth: result.width,
+                upscaledHeight: result.height,
+                upscaleNotes: result.profile.upscaleNotes,
+                restorationMethod: methodLabel,
+              }
+            : item
+        )
+      );
+
+      await saveRestorationJobToFirestore({
+        jobId: target.id,
+        fileName: target.name,
+        source: target.source,
+        width: result.width,
+        height: result.height,
+        regionCount: target.detectedRegions.length,
+        watermarkType:
+          target.watermarkType || '5K AI Super-Resolution',
+        restorationMethod: methodLabel,
+        status: 'restored',
+        driveFileId: target.driveFileId,
+      });
+    } catch (err: any) {
+      setItems((prev) =>
+        prev.map((item) =>
+          item.id === target.id
+            ? {
+                ...item,
+                status:
+                  previousStatus === 'upscaling'
+                    ? item.restoredDataUrl
+                      ? 'restored'
+                      : 'queued'
+                    : previousStatus,
+                errorMessage:
+                  err?.message || '5K AI upscaling could not be completed.',
+              }
+            : item
+        )
+      );
+    }
+  };
+
+  const handleUpscaleImage = async (id: string): Promise<void> => {
+    const target = items.find((i) => i.id === id);
+    if (!target) return;
+    setStatusBanner(`Upscaling ${target.name} to 5K (5120px) with AI...`);
+    await upscaleSingleItem(target);
+    setStatusBanner(`Upscaled ${target.name} to 5K AI lossless PNG.`);
+  };
+
+  const handleBatchUpscale5K = async () => {
+    const selected = items.filter((i) => i.selectedForBatch);
+    const targets = applyToAll
+      ? items
+      : selected.length > 0
+      ? selected
+      : items;
+    if (targets.length === 0) return;
+
+    setIsBatchProcessing(true);
+    let completedCount = 0;
+    setStatusBanner(
+      `Upscaling images to 5K (5120px) with AI (0/${targets.length})...`
+    );
+
+    await runWithConcurrency(
+      targets,
+      PARALLEL_UPSCALE_WORKERS,
+      async (item) => {
+        await upscaleSingleItem(item);
+        completedCount++;
+        setStatusBanner(
+          `Upscaling images to 5K (5120px) with AI (${completedCount}/${targets.length}: ${item.name})...`
+        );
+      }
+    );
+
+    setIsBatchProcessing(false);
+    setStatusBanner(
+      `5K AI upscaling complete across ${targets.length} image${
+        targets.length === 1 ? '' : 's'
+      } (5120px long edge).`
     );
   };
 
@@ -1142,8 +1270,20 @@ export default function App() {
               >
                 <Sparkles className="w-4 h-4" />
                 {isBatchProcessing
-                  ? 'Removing Watermarks...'
+                  ? 'Processing Batch...'
                   : `Remove Watermark All (${items.length})`}
+              </button>
+
+              <button
+                type="button"
+                disabled={isBatchProcessing || items.length === 0}
+                onClick={handleBatchUpscale5K}
+                className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Maximize2 className="w-4 h-4 text-emerald-400" />
+                {isBatchProcessing
+                  ? 'Upscaling 5K...'
+                  : `5K AI Upscale All (${items.length})`}
               </button>
             </div>
           </div>
@@ -1273,24 +1413,35 @@ export default function App() {
                           </p>
                           <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500 font-mono tabular-nums">
                             <span>
-                              {item.width}×{item.height} px
+                              {item.upscaled5k && item.upscaledWidth && item.upscaledHeight
+                                ? `${item.width}×${item.height} → ${item.upscaledWidth}×${item.upscaledHeight} px (5K)`
+                                : `${item.width}×${item.height} px`}
                             </span>
                             <span aria-hidden="true">·</span>
                             <span>{(item.sizeBytes / 1024).toFixed(0)} KB</span>
                             <span aria-hidden="true">·</span>
                             <span
                               className={
-                                item.restoredDataUrl
+                                item.upscaled5k
+                                  ? 'text-emerald-700 font-semibold'
+                                  : item.restoredDataUrl
                                   ? 'text-emerald-700 font-semibold'
                                   : item.status === 'restoring' ||
-                                    item.status === 'detecting'
+                                    item.status === 'detecting' ||
+                                    item.status === 'upscaling'
                                   ? 'text-blue-600 font-semibold'
                                   : item.detectedRegions.length > 0
                                   ? 'text-blue-700 font-medium'
                                   : 'text-slate-500'
                               }
                             >
-                              {item.restoredDataUrl
+                              {item.status === 'upscaling'
+                                ? 'Upscaling to 5K (AI)...'
+                                : item.upscaled5k
+                                ? item.restorationMethod?.includes('Watermark Removed')
+                                  ? 'Watermark Removed + 5K AI'
+                                  : '5K AI Upscaled'
+                                : item.restoredDataUrl
                                 ? 'Bottom-Right Watermark Removed'
                                 : item.status === 'restoring'
                                 ? 'Removing Watermark...'
@@ -1326,6 +1477,7 @@ export default function App() {
                           disabled={
                             item.status === 'detecting' ||
                             item.status === 'restoring' ||
+                            item.status === 'upscaling' ||
                             isBatchProcessing
                           }
                           onClick={(e) => {
@@ -1342,6 +1494,7 @@ export default function App() {
                           disabled={
                             item.status === 'detecting' ||
                             item.status === 'restoring' ||
+                            item.status === 'upscaling' ||
                             isBatchProcessing
                           }
                           onClick={(e) => {
@@ -1350,7 +1503,37 @@ export default function App() {
                           }}
                           className="px-2.5 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-md transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
                         >
-                          {item.restoredDataUrl ? 'Re-Run' : 'Remove Watermark'}
+                          {item.restoredDataUrl &&
+                          !item.restorationMethod?.startsWith('5K AI Super-Resolution')
+                            ? 'Re-Run'
+                            : 'Remove Watermark'}
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={
+                            item.status === 'detecting' ||
+                            item.status === 'restoring' ||
+                            item.status === 'upscaling' ||
+                            isBatchProcessing
+                          }
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleUpscaleImage(item.id);
+                          }}
+                          className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer ${
+                            item.upscaled5k
+                              ? 'text-emerald-800 bg-emerald-50 hover:bg-emerald-100'
+                              : 'text-slate-800 bg-slate-100 hover:bg-slate-200'
+                          }`}
+                          title="AI Upscale image to 5K (5120px)"
+                        >
+                          <Maximize2 className="w-3 h-3" />
+                          {item.status === 'upscaling'
+                            ? 'Upscaling...'
+                            : item.upscaled5k
+                            ? '5K AI ✓'
+                            : '5K Upscale'}
                         </button>
 
                         <button
@@ -1580,8 +1763,13 @@ export default function App() {
                     {previewItem.name}
                   </h3>
                   <p className="text-[11px] font-mono tabular-nums text-slate-500">
-                    {previewItem.width}×{previewItem.height} px ·{' '}
-                    {(previewItem.sizeBytes / 1024).toFixed(0)} KB
+                    {previewMode === 'restored' &&
+                    previewItem.upscaled5k &&
+                    previewItem.upscaledWidth &&
+                    previewItem.upscaledHeight
+                      ? `${previewItem.upscaledWidth}×${previewItem.upscaledHeight} px (5K AI)`
+                      : `${previewItem.width}×${previewItem.height} px`}{' '}
+                    · {(previewItem.sizeBytes / 1024).toFixed(0)} KB
                   </p>
                 </div>
               </div>
@@ -1598,7 +1786,7 @@ export default function App() {
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
                     >
-                      Restored
+                      {previewItem.upscaled5k ? '5K AI Output' : 'Restored'}
                     </button>
                     <button
                       type="button"

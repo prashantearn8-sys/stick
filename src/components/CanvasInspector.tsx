@@ -35,6 +35,7 @@ export interface BatchImageItem {
     | 'detected'
     | 'restoring'
     | 'restored'
+    | 'upscaling'
     | 'error';
   errorMessage?: string;
   detectedRegions: WatermarkRegion[];
@@ -42,6 +43,10 @@ export interface BatchImageItem {
   estimatedOpacity?: number;
   restorationStrategy?: string;
   restorationMethod?: string;
+  upscaled5k?: boolean;
+  upscaledWidth?: number;
+  upscaledHeight?: number;
+  upscaleNotes?: string;
   selectedForBatch: boolean;
 }
 
